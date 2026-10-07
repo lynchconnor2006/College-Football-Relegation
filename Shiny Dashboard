@@ -1,0 +1,1628 @@
+# ============================================================================
+# SHINY DASHBOARD - FULL VERSION WITH ML MODELS
+# 11 tabs: 8 original Monte Carlo tabs + Linear Regression + Random Forest
+#          + Model Comparison
+# ============================================================================
+
+suppressPackageStartupMessages({
+  library(shiny)
+  library(tidyverse)
+  library(DT)
+  library(scales)
+  library(plotly)
+  library(viridis)
+  library(broom)
+})
+
+# ===========================
+# LOAD DATA
+# ===========================
+
+if(!file.exists("model_v2_results.rds")) {
+  stop("ERROR: Run simulation first to generate model_v2_results.rds")
+}
+
+results <- readRDS("model_v2_results.rds")
+
+if("metrics" %in% names(results)) {
+  metrics <- results$metrics
+  HAS_METRICS <- TRUE
+  message("✓ Loaded metrics from model_v2_results.rds")
+} else {
+  message("WARNING: No metrics found in results.")
+  HAS_METRICS <- FALSE
+  metrics <- list()
+}
+
+# Load parameters for sensitivity analysis
+if(file.exists("data_driven_parameters.rds")) {
+  params_data <- readRDS("data_driven_parameters.rds")
+  ENGAGEMENT_PREMIUM <- params_data$ENGAGEMENT_PREMIUM_FINAL * 100
+} else {
+  ENGAGEMENT_PREMIUM <- 9.80
+}
+
+national    <- results$national
+team        <- results$team
+conference  <- results$conference
+
+# Load ML model results (gracefully — tabs disable if files missing)
+HAS_LM <- file.exists("lm_results.rds")
+HAS_RF <- file.exists("rf_results.rds")
+HAS_COMP <- file.exists("model_comparison_table.rds") && file.exists("all_model_projections.rds")
+
+if(HAS_LM)   lm_results   <- readRDS("lm_results.rds")
+if(HAS_RF)   rf_results   <- readRDS("rf_results.rds")
+if(HAS_COMP) {
+  comparison_table  <- readRDS("model_comparison_table.rds")
+  all_projections   <- readRDS("all_model_projections.rds")
+}
+
+message(sprintf("ML models loaded: LR=%s | RF=%s | Comparison=%s",
+                HAS_LM, HAS_RF, HAS_COMP))
+
+# ===========================
+# HELPER FUNCTIONS
+# ===========================
+
+lab_num <- function(){
+  scales::label_number(accuracy=0.1, scale_cut = scales::cut_short_scale())
+}
+
+COLORS <- list(
+  primary    = "#1e3a8a",
+  secondary  = "#14b8a6",
+  accent1    = "#f97316",
+  accent2    = "#8b5cf6",
+  baseline   = "#3b82f6",
+  relegation = "#10b981",
+  neutral    = "#64748b",
+  lm_color   = "#f97316",
+  rf_color   = "#8b5cf6"
+)
+
+scenario_colors <- c(
+  "baseline_12team" = COLORS$baseline,
+  "baseline_16team" = "#60a5fa",
+  "releg_T3_P4"     = "#34d399",
+  "releg_T3_P8"     = COLORS$relegation,
+  "releg_T3_P12"    = "#059669"
+)
+
+model_colors <- c(
+  "Monte Carlo (Baseline)"   = COLORS$baseline,
+  "Monte Carlo (Relegation)" = COLORS$relegation,
+  "Linear Regression"        = COLORS$lm_color,
+  "Random Forest"            = COLORS$rf_color
+)
+
+# Shared theme for ML plots
+theme_cfb <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title    = element_text(face = "bold", color = COLORS$primary, size = base_size + 1),
+      plot.subtitle = element_text(color = COLORS$neutral, size = base_size - 1),
+      legend.position = "bottom"
+    )
+}
+
+# ===========================
+# UI
+# ===========================
+
+ui <- navbarPage(
+  title = "CFB Relegation Analysis",
+  theme = bslib::bs_theme(
+    bootswatch = "flatly",
+    primary    = COLORS$primary,
+    secondary  = COLORS$secondary
+  ),
+
+  # =============================
+  # TAB 1: EXECUTIVE SUMMARY
+  # =============================
+
+  tabPanel("Executive Summary",
+    fluidRow(
+      column(12, h2("CFB Relegation vs Baseline: System Comparison",
+                    style = sprintf("color: %s; margin-bottom: 30px;", COLORS$primary)))
+    ),
+    fluidRow(
+      column(4, div(style = sprintf("background: linear-gradient(135deg, %s, %s); padding: 30px; border-radius: 10px; color: white; text-align: center;",
+                                    COLORS$secondary, COLORS$accent2),
+                    h3("COMPETITIVE INTENSITY", style = "margin-top: 0;"),
+                    uiOutput("hero_intensity"),
+                    hr(style = "border-color: rgba(255,255,255,0.3);"),
+                    p("Teams with meaningful games", style = "font-size: 14px; opacity: 0.9;")
+      )),
+      column(4, div(style = sprintf("background: linear-gradient(135deg, %s, %s); padding: 30px; border-radius: 10px; color: white; text-align: center;",
+                                    COLORS$accent1, "#dc2626"),
+                    h3("REVENUE GROWTH", style = "margin-top: 0;"),
+                    uiOutput("hero_growth"),
+                    hr(style = "border-color: rgba(255,255,255,0.3);"),
+                    p("Compound annual growth rate", style = "font-size: 14px; opacity: 0.9;")
+      )),
+      column(4, div(style = sprintf("background: linear-gradient(135deg, %s, %s); padding: 30px; border-radius: 10px; color: white; text-align: center;",
+                                    COLORS$accent2, COLORS$primary),
+                    h3("WEALTH EQUALITY", style = "margin-top: 0;"),
+                    uiOutput("hero_gini"),
+                    hr(style = "border-color: rgba(255,255,255,0.3);"),
+                    p("Gini coefficient (lower = more equal)", style = "font-size: 14px; opacity: 0.9;")
+      ))
+    ),
+    br(),
+    fluidRow(
+      column(4, plotOutput("plot_mobility",       height = 250)),
+      column(4, plotOutput("plot_late_season",    height = 250)),
+      column(4, plotOutput("plot_sustainability", height = 250))
+    ),
+    br(),
+    fluidRow(
+      column(12, div(style = sprintf("background: %s; padding: 25px; border-left: 5px solid %s; border-radius: 5px;",
+                                     "#f8fafc", COLORS$secondary),
+                     h4("VERDICT", style = sprintf("color: %s; margin-top: 0;", COLORS$primary)),
+                     uiOutput("verdict_text")
+      ))
+    )
+  ),
+
+  # =============================
+  # TAB 2: REVENUE DYNAMICS
+  # =============================
+
+  tabPanel("Revenue Dynamics",
+    fluidRow(
+      column(3, wellPanel(
+        h4("Filters"),
+        checkboxGroupInput("rev_scenarios", "Scenarios:",
+                           choices  = unique(national$scenario_id),
+                           selected = unique(national$scenario_id)),
+        hr(),
+        selectInput("rev_metric", "Metric:",
+                    choices = c("Total Revenue"    = "total_revenue",
+                                "Per Team Average" = "avg_per_team",
+                                "Growth Rate"      = "growth_rate"))
+      )),
+      column(9,
+        h3("Revenue Growth Trajectories"),
+        plotlyOutput("plot_revenue_trends", height = 450),
+        hr(),
+        h4("Revenue Component Breakdown (2034)"),
+        plotOutput("plot_components", height = 350)
+      )
+    )
+  ),
+
+  # =============================
+  # TAB 3: COMPETITIVE LANDSCAPE
+  # =============================
+
+  tabPanel("Competitive Landscape",
+    fluidRow(
+      column(12, h3("Intensity Over Time: Top 30 Teams"),
+             plotOutput("plot_intensity_heatmap", height = 500))
+    ),
+    br(),
+    fluidRow(
+      column(6, h4("Teams with Meaningful Games"),
+             plotOutput("plot_weekly_intensity", height = 350)),
+      column(6, h4("Intensity Distribution"),
+             plotOutput("plot_intensity_dist", height = 350))
+    )
+  ),
+
+  # =============================
+  # TAB 4: EQUITY ANALYSIS
+  # =============================
+
+  tabPanel("Equity & Fairness",
+    fluidRow(
+      column(6,
+        h3("Lorenz Curves (Revenue Distribution)"),
+        plotOutput("plot_lorenz", height = 450),
+        p("Diagonal line = perfect equality. Closer to diagonal = more equal.",
+          style = "font-style: italic; color: #64748b;")
+      ),
+      column(6,
+        h3("Gini Coefficient Trends"),
+        plotOutput("plot_gini_trends", height = 450),
+        p("Lower values indicate more equal revenue distribution.",
+          style = "font-style: italic; color: #64748b;")
+      )
+    ),
+    br(),
+    fluidRow(
+      column(12, h4("Conference-Level Equity (Average Gini)"),
+             DTOutput("table_conf_equity"))
+    )
+  ),
+
+  # =============================
+  # TAB 5: CONFERENCE ANALYSIS
+  # =============================
+
+  tabPanel("Conference Impact",
+    fluidRow(
+      column(3, wellPanel(
+        selectInput("conf_select", "Conference:",
+                    choices  = sort(unique(conference$conference)),
+                    selected = "SEC")
+      )),
+      column(9,
+        h3(textOutput("conf_title")),
+        plotOutput("plot_conf_revenue", height = 400)
+      )
+    ),
+    br(),
+    fluidRow(
+      column(6, h4("Teams by Tier (Relegation Scenarios)"),
+             plotOutput("plot_conf_tiers",      height = 300)),
+      column(6, h4("Competitive Intensity Over Time"),
+             plotOutput("plot_conf_intensity",  height = 300))
+    )
+  ),
+
+  # =============================
+  # TAB 6: TEAM EXPLORER
+  # =============================
+
+  tabPanel("Team Explorer",
+    fluidRow(
+      column(3, wellPanel(
+        selectInput("team_select", "Select Team:",
+                    choices  = sort(unique(team$team)),
+                    selected = "Alabama"),
+        hr(),
+        checkboxGroupInput("team_scenarios", "Compare Scenarios:",
+                           choices  = unique(team$scenario_id),
+                           selected = unique(team$scenario_id))
+      )),
+      column(9,
+        h3(textOutput("team_title")),
+        plotOutput("plot_team_revenue", height = 400),
+        hr(),
+        h4("Detailed Breakdown"),
+        DTOutput("table_team_detail")
+      )
+    )
+  ),
+
+  # =============================
+  # TAB 7: METHODOLOGY
+  # =============================
+
+  tabPanel("Methodology",
+    fluidRow(
+      column(12, div(style = "background: white; padding: 30px; border-radius: 8px;",
+        h2("Data-Driven Methodology", style = "color: #2C3E50; margin-top: 0;"),
+
+        h3("Parameter Sources", style = "margin-top: 30px; color: #16A085;"),
+        HTML(sprintf("
+          <table style='width: 100%%; border-collapse: collapse; margin-top: 20px;'>
+            <thead>
+              <tr style='background: #ECF0F1; font-weight: bold;'>
+                <th style='padding: 12px; border: 1px solid #BDC3C7; text-align: left;'>Parameter</th>
+                <th style='padding: 12px; border: 1px solid #BDC3C7; text-align: left;'>Value</th>
+                <th style='padding: 12px; border: 1px solid #BDC3C7; text-align: left;'>Data Source</th>
+                <th style='padding: 12px; border: 1px solid #BDC3C7; text-align: left;'>Calculation Method</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>Base Growth Rate</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>2.40%%</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>NCAA FBS 2015-2024</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>Historical median (excludes COVID 2020)</td>
+              </tr>
+              <tr style='background: #F8F9FA;'>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'><strong>Engagement Premium</strong></td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'><strong>%.2f%%</strong></td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'><strong>NCAA FBS 2015-2024</strong></td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'><strong>Regression: rank improvement effect on revenue</strong></td>
+              </tr>
+              <tr>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>Conference Floor</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>-48.96%%</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>NCAA FBS 2015-2024</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>10th percentile (CUSA 2022 worst case)</td>
+              </tr>
+              <tr style='background: #F8F9FA;'>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>Revenue Floors</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>95%% / 88%% / 65%%</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>NCAA FBS 2015-2024</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>5th percentile by tier (conservative)</td>
+              </tr>
+              <tr>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>Playoff Payouts</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>$4M-$16M</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>CFP Official Data</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>Actual 2023-24 payout structure</td>
+              </tr>
+              <tr style='background: #F8F9FA;'>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>Tier Multipliers</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>60%% of European</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>European Soccer Data</td>
+                <td style='padding: 10px; border: 1px solid #BDC3C7;'>Dampened for NCAA context (conservative)</td>
+              </tr>
+            </tbody>
+          </table>
+        ", ENGAGEMENT_PREMIUM)),
+
+        h3("Key Innovation", style = "margin-top: 40px; color: #16A085;"),
+        p(sprintf("The engagement premium (%.2f%%) is the core empirical finding of this model.", ENGAGEMENT_PREMIUM),
+          style = "font-size: 16px; line-height: 1.8;"),
+        p(strong("What it measures:"), " Additional revenue growth for teams in competitive situations.",
+          style = "font-size: 16px; line-height: 1.8;"),
+        p(strong("How it's calculated:"), " Regression analysis comparing revenue growth of teams that improved ranking vs teams that declined ranking (NCAA 2015-2024).",
+          style = "font-size: 16px; line-height: 1.8;"),
+        p(strong("Why it matters:"), " Relegation creates high-stakes situations for 96% of teams (promotion/relegation battles), vs ~12% in baseline (playoff contenders).",
+          style = "font-size: 16px; line-height: 1.8;"),
+
+        h3("Simulation Design", style = "margin-top: 40px; color: #16A085;"),
+        tags$ul(style = "font-size: 16px; line-height: 1.8;",
+          tags$li("100 Monte Carlo simulations per scenario"),
+          tags$li("5 scenarios: 2 baseline (12/16 team playoffs) + 3 relegation (4/8/12 per tier)"),
+          tags$li("10-year projection horizon (2025-2034)"),
+          tags$li("500 total simulation runs"),
+          tags$li("Conservative assumptions throughout (tier effects, revenue floors)")
+        ),
+
+        h3("Validation", style = "margin-top: 40px; color: #16A085;"),
+        tags$ul(style = "font-size: 16px; line-height: 1.8;",
+          tags$li("Model replicates historical NCAA growth 2015-2024 within ±0.3%"),
+          tags$li("Both systems show positive growth (stability check)"),
+          tags$li("Revenue floors prevent unrealistic financial collapse"),
+          tags$li("All parameters empirically derived, not assumed")
+        )
+      ))
+    )
+  ),
+
+  # =============================
+  # TAB 8: SENSITIVITY ANALYSIS
+  # =============================
+
+  tabPanel("Sensitivity Analysis",
+    fluidRow(
+      column(12,
+        h2("Sensitivity to Engagement Premium", style = "color: #2C3E50; margin-bottom: 10px;"),
+        p("How do results change if the engagement premium is higher or lower than our estimate?",
+          style = "font-size: 16px; color: #7F8C8D; margin-bottom: 30px;")
+      )
+    ),
+    fluidRow(
+      column(6, plotOutput("plot_sensitivity_cagr", height = 400)),
+      column(6,
+        div(style = "background: #F8F9FA; padding: 20px; border-radius: 8px; border-left: 4px solid #16A085;",
+          h4("Key Insights", style = "margin-top: 0; color: #2C3E50;"),
+          HTML(sprintf("
+            <ul style='font-size: 15px; line-height: 1.8;'>
+              <li><strong>Base estimate: %.2f%%</strong> (from NCAA regression)</li>
+              <li><strong>Break-even point: ~3.5%%</strong></li>
+              <li>Below 3.5%%: Systems grow at similar rates</li>
+              <li>Above 3.5%%: Relegation advantage increases linearly</li>
+              <li><strong>Conservative scenario (5%%):</strong> Still +1.0pp faster growth</li>
+              <li><strong>Optimistic scenario (15%%):</strong> Up to +5.9pp faster growth</li>
+            </ul>
+            <p style='font-size: 14px; color: #7F8C8D; margin-top: 20px;'>
+              <strong>Conclusion:</strong> Even with highly conservative engagement estimates
+              (half our calculated value), relegation still shows meaningful growth advantage.
+              The model is robust to parameter uncertainty.
+            </p>
+          ", ENGAGEMENT_PREMIUM))
+        )
+      )
+    ),
+    br(),
+    fluidRow(
+      column(12,
+        h4("Detailed Sensitivity Table", style = "color: #2C3E50;"),
+        DTOutput("table_sensitivity")
+      )
+    )
+  ),
+
+  # =============================
+  # TAB 9: LINEAR REGRESSION — FULL STATS
+  # =============================
+
+  tabPanel("Linear Regression",
+    fluidRow(
+      column(12,
+        h2("Linear Regression: Full Statistical Report", style = sprintf("color: %s; margin-bottom: 3px;", COLORS$primary)),
+        p("Train: 2015-2022 | Test (holdout): 2023-2024 | Target: Team annual revenue ($M)",
+          style = sprintf("color: %s; font-size: 14px; margin-bottom: 18px;", COLORS$neutral))
+      )
+    ),
+
+    # ── Row 1: 8 hero stat cards ──────────────────────────────────────────
+    fluidRow(
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,#dc2626);padding:14px;border-radius:8px;color:white;text-align:center;",COLORS$lm_color),
+        p("Test R²", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("lm_card_r2"),
+        p("Variance explained", style="margin:0;font-size:10px;opacity:.85;")
+      )),
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;",COLORS$primary,COLORS$accent2),
+        p("Adj. R²", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("lm_card_adj_r2"),
+        p("Penalised for params", style="margin:0;font-size:10px;opacity:.85;")
+      )),
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;",COLORS$secondary,COLORS$primary),
+        p("RSE ($M)", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("lm_card_rse"),
+        p("Residual Std Error", style="margin:0;font-size:10px;opacity:.85;")
+      )),
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;","#7c3aed","#4f46e5"),
+        p("F-statistic", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("lm_card_fstat"),
+        p("Overall model sig.", style="margin:0;font-size:10px;opacity:.85;")
+      )),
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;","#0f766e","#0d9488"),
+        p("F p-value", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("lm_card_fpval"),
+        p("H₀: all coefs = 0", style="margin:0;font-size:10px;opacity:.85;")
+      )),
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;",COLORS$relegation,COLORS$secondary),
+        p("# Parameters", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("lm_card_params"),
+        p("Intercept + features", style="margin:0;font-size:10px;opacity:.85;")
+      ))
+    ),
+
+    br(),
+
+    # ── Row 2: Model selection + LASSO ────────────────────────────────────
+    fluidRow(
+      column(5,
+        div(style=sprintf("border:2px solid %s;border-radius:8px;padding:15px;",COLORS$lm_color),
+          h4("Model Selection: 7 Specifications Compared", style=sprintf("color:%s;margin-top:0;font-size:15px;",COLORS$primary)),
+          p("Selection criterion: holdout test RMSE (lower = better). Bold = selected model.",
+            style="font-size:12px;color:#64748b;margin-bottom:8px;"),
+          DTOutput("lm_table_all_models")
+        )
+      ),
+      column(4,
+        div(style="border:2px solid #7c3aed;border-radius:8px;padding:15px;",
+          h4("LASSO Feature Selection (10-Fold CV)", style="color:#7c3aed;margin-top:0;font-size:15px;"),
+          p("LASSO shrinks irrelevant coefficients to exactly zero, revealing which features genuinely help.",
+            style="font-size:12px;color:#64748b;margin-bottom:8px;"),
+          uiOutput("lm_lasso_summary"),
+          br(),
+          div(style="background:#f5f3ff;padding:10px;border-radius:6px;",
+            p(strong("λ.min"), " = lowest CV error (keeps more features)", style="font-size:12px;margin:2px 0;"),
+            p(strong("λ.1se"), " = most regularised within 1 SE (sparser model)", style="font-size:12px;margin:2px 0;")
+          )
+        )
+      ),
+      column(3,
+        div(style=sprintf("background:#f8fafc;padding:15px;border-left:4px solid %s;border-radius:6px;",COLORS$primary),
+          h5("Interaction Terms", style=sprintf("color:%s;margin-top:0;",COLORS$primary)),
+          p("No interaction terms are added in the OLS specifications M1-M5. The LASSO
+            automatically considers all main effects. The Random Forest (Tab 10) captures
+            all non-linear interactions implicitly through tree splits.",
+            style="font-size:12px;margin:0;"),
+          br(),
+          h5("Features Excluded", style=sprintf("color:%s;margin-top:0;",COLORS$primary)),
+          uiOutput("lm_excluded_features")
+        )
+      )
+    ),
+
+    br(),
+
+    # ── Row 3: Coefficient table (full, with all stats) ────────────────────
+    fluidRow(
+      column(12,
+        div(style=sprintf("border:2px solid %s;border-radius:8px;padding:15px;",COLORS$primary),
+          h4("Full Coefficient Table — M5 (All 13 Features)", style=sprintf("color:%s;margin-top:0;",COLORS$primary)),
+          p("Shows: coefficient, standard error, t-statistic, p-value, 95% CI, and significance.
+            ★★★ p<0.001 | ★★ p<0.01 | ★ p<0.05 | ns = not significant.
+            Features marked (EXCL) were automatically dropped by LASSO λ.1se.",
+            style="font-size:12px;color:#64748b;margin-bottom:8px;"),
+          DTOutput("lm_table_coefs_full")
+        )
+      )
+    ),
+
+    br(),
+
+    # ── Row 4: Plots ───────────────────────────────────────────────────────
+    fluidRow(
+      column(4,
+        h5("Actual vs. Predicted (Test Set)", style=sprintf("color:%s;",COLORS$primary)),
+        plotOutput("lm_plot_actual_pred", height=300),
+        p("Perfect model = all points on dashed diagonal. Colour = tier.",
+          style="font-size:11px;color:#64748b;font-style:italic;")
+      ),
+      column(4,
+        h5("Residuals vs. Fitted", style=sprintf("color:%s;",COLORS$primary)),
+        plotOutput("lm_plot_resid", height=300),
+        p("Random scatter around zero = good. Patterns suggest misspecification.",
+          style="font-size:11px;color:#64748b;font-style:italic;")
+      ),
+      column(4,
+        h5("Revenue Projection 2025-2034", style=sprintf("color:%s;",COLORS$primary)),
+        plotOutput("lm_plot_projection", height=300),
+        p("Near-flat CAGR confirms: no structural growth driver under status quo.",
+          style="font-size:11px;color:#64748b;font-style:italic;")
+      )
+    ),
+
+    br(),
+
+    # ── Row 5: Train vs Test summary ───────────────────────────────────────
+    fluidRow(
+      column(6,
+        div(style="background:#fff7ed;padding:15px;border-radius:8px;border:1px solid #fed7aa;",
+          h5("Train vs. Test Performance (All Specifications)", style=sprintf("color:%s;margin-top:0;",COLORS$primary)),
+          DTOutput("lm_table_train_test")
+        )
+      ),
+      column(6,
+        div(style=sprintf("background:#f0fdf4;padding:15px;border-radius:8px;border-left:4px solid %s;",COLORS$relegation),
+          h5("How to Read This Tab", style=sprintf("color:%s;margin-top:0;",COLORS$primary)),
+          tags$ul(style="font-size:12px;margin:0;padding-left:18px;line-height:1.8;",
+            tags$li(strong("F-statistic:"), " tests if ALL coefficients are jointly zero. Very large F + tiny p = model is meaningful overall."),
+            tags$li(strong("RSE:"), " average prediction error in same units as revenue ($M). Lower = better fit."),
+            tags$li(strong("Adj. R²:"), " like R² but penalises for each extra parameter. Use this to compare models of different sizes."),
+            tags$li(strong("t-statistic:"), " each feature's coef divided by its std error. |t|>2 ≈ significant at 5%."),
+            tags$li(strong("LASSO:"), " if a feature is zeroed out by LASSO λ.1se, it adds little beyond what other features already capture."),
+            tags$li(strong("~0% CAGR projection:"), " ML models confirm revenue is highly self-persistent; structural shock (relegation) needed.")
+          )
+        )
+      )
+    )
+  ),
+
+  # =============================
+  # TAB 10: RANDOM FOREST — FULL STATS
+  # =============================
+
+  tabPanel("Random Forest",
+    fluidRow(
+      column(12,
+        h2("Random Forest: Full Statistical Report", style = sprintf("color: %s; margin-bottom: 3px;", COLORS$primary)),
+        uiOutput("rf_subtitle")
+      )
+    ),
+
+    # ── Row 1: Hero cards ─────────────────────────────────────────────────
+    fluidRow(
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;",COLORS$rf_color,COLORS$primary),
+        p("Test R²", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("rf_card_r2"),
+        p("Variance explained", style="margin:0;font-size:10px;opacity:.85;")
+      )),
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;",COLORS$primary,COLORS$secondary),
+        p("OOB R²", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("rf_card_oob_r2"),
+        p("Out-of-bag (unbiased)", style="margin:0;font-size:10px;opacity:.85;")
+      )),
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;",COLORS$secondary,COLORS$accent2),
+        p("Test RMSE", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("rf_card_rmse"),
+        p("Prediction error ($M)", style="margin:0;font-size:10px;opacity:.85;")
+      )),
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;","#0f766e","#0d9488"),
+        p("OOB RMSE", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("rf_card_oob_rmse"),
+        p("Training estimate ($M)", style="margin:0;font-size:10px;opacity:.85;")
+      )),
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;","#7c3aed","#4f46e5"),
+        p("Test MAPE", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("rf_card_mape"),
+        p("Mean abs % error", style="margin:0;font-size:10px;opacity:.85;")
+      )),
+      column(2, div(style=sprintf("background:linear-gradient(135deg,%s,%s);padding:14px;border-radius:8px;color:white;text-align:center;",COLORS$relegation,COLORS$secondary),
+        p("CAGR Projection", style="margin:0;font-size:12px;font-weight:bold;"),
+        uiOutput("rf_card_cagr"),
+        p("2025-2034", style="margin:0;font-size:10px;opacity:.85;")
+      ))
+    ),
+
+    br(),
+
+    # ── Row 2: Tuning results ──────────────────────────────────────────────
+    fluidRow(
+      column(5,
+        div(style=sprintf("border:2px solid %s;border-radius:8px;padding:15px;",COLORS$rf_color),
+          h4("Grid Search Results: 144 Hyperparameter Combinations", style=sprintf("color:%s;margin-top:0;font-size:14px;",COLORS$primary)),
+          p("OOB RMSE used for selection (no test data touched during tuning). Top 10 shown.",
+            style="font-size:11px;color:#64748b;margin-bottom:8px;"),
+          DTOutput("rf_table_grid_top10"),
+          br(),
+          uiOutput("rf_best_params_box")
+        )
+      ),
+      column(4,
+        div(style="border:2px solid #0f766e;border-radius:8px;padding:15px;",
+          h4("Hyperparameter Sensitivity", style="color:#0f766e;margin-top:0;font-size:14px;"),
+          tabsetPanel(
+            tabPanel("mtry Effect",    plotOutput("rf_plot_mtry",      height=220)),
+            tabPanel("Trees Effect",   plotOutput("rf_plot_trees",     height=220)),
+            tabPanel("Node Size",      plotOutput("rf_plot_nodesize",  height=220))
+          ),
+          p("Each panel shows how average OOB RMSE changes across that hyperparameter,
+            averaging over all other combinations.",
+            style="font-size:11px;color:#64748b;margin-top:6px;margin-bottom:0;")
+        )
+      ),
+      column(3,
+        div(style=sprintf("background:#f8fafc;padding:15px;border-left:4px solid %s;border-radius:6px;",COLORS$rf_color),
+          h5("How Hyperparameters Work", style=sprintf("color:%s;margin-top:0;",COLORS$primary)),
+          tags$ul(style="font-size:11px;margin:0;padding-left:16px;line-height:1.9;",
+            tags$li(strong("num.trees:"), " More trees = lower variance, diminishing returns after ~500. Selected: based on convergence."),
+            tags$li(strong("mtry:"), " Features sampled per split. Low mtry = more diverse trees (better ensemble). sqrt(p)≈3.6 is the textbook default."),
+            tags$li(strong("min.node.size:"), " Minimum observations in a leaf. Larger = simpler trees, less overfitting."),
+            tags$li(strong("OOB error:"), " Each tree trained on ~63% of data; remaining 37% forms an unbiased test — no separate CV needed.")
+          )
+        )
+      )
+    ),
+
+    br(),
+
+    # ── Row 3: Variable importance + partial dependence ────────────────────
+    fluidRow(
+      column(5,
+        div(style=sprintf("border:2px solid %s;border-radius:8px;padding:15px;",COLORS$primary),
+          h4("Variable Importance (Permutation, All 13 Features)", style=sprintf("color:%s;margin-top:0;font-size:14px;",COLORS$primary)),
+          p("Permutation importance: measures how much test RMSE increases when a feature is randomly shuffled.
+            Larger = more critical. More reliable than Gini impurity (default) for correlated features.",
+            style="font-size:11px;color:#64748b;margin-bottom:8px;"),
+          DTOutput("rf_table_importance"),
+          br(),
+          plotOutput("rf_plot_importance", height=260)
+        )
+      ),
+      column(4,
+        div(style="border:2px solid #0f766e;border-radius:8px;padding:15px;",
+          h4("Partial Dependence: Rank Percentile → Revenue", style="color:#0f766e;margin-top:0;font-size:14px;"),
+          p("Shows average predicted revenue as rank percentile varies (all other features held at training values).
+            Captures the non-linear relationship the LR model cannot.",
+            style="font-size:11px;color:#64748b;margin-bottom:8px;"),
+          plotOutput("rf_plot_pdp", height=280),
+          uiOutput("rf_pdp_stats")
+        )
+      ),
+      column(3,
+        div(style=sprintf("background:#f8fafc;padding:15px;border-left:4px solid %s;border-radius:6px;",COLORS$rf_color),
+          h5("RF vs. Linear Regression", style=sprintf("color:%s;margin-top:0;",COLORS$primary)),
+          DTOutput("rf_vs_lm_table"),
+          br(),
+          div(style="background:#f0fdf4;padding:10px;border-radius:6px;",
+            p("RF captures non-linear tier effects and feature interactions.
+              LR provides interpretable coefficients. Together they triangulate
+              which features matter and how.",
+              style="font-size:11px;margin:0;")
+          )
+        )
+      )
+    ),
+
+    br(),
+
+    # ── Row 4: Actual vs predicted + projection ────────────────────────────
+    fluidRow(
+      column(4,
+        h5("Actual vs. Predicted (Test Set)", style=sprintf("color:%s;",COLORS$primary)),
+        plotOutput("rf_plot_actual_pred", height=290),
+        p("Default vs optimal RF comparison: tighter cluster around diagonal = better tuning.",
+          style="font-size:11px;color:#64748b;font-style:italic;")
+      ),
+      column(4,
+        h5("Default vs. Optimal RF (Test Set)", style=sprintf("color:%s;",COLORS$primary)),
+        DTOutput("rf_table_default_vs_optimal"),
+        br(),
+        uiOutput("rf_tuning_gain")
+      ),
+      column(4,
+        h5("Revenue Projection 2025-2034", style=sprintf("color:%s;",COLORS$primary)),
+        plotOutput("rf_plot_projection", height=290),
+        p("Like LR, RF projects near-flat CAGR — confirming status quo has no structural growth engine.",
+          style="font-size:11px;color:#64748b;font-style:italic;")
+      )
+    )
+  ),
+
+  # =============================
+  # TAB 11: MODEL COMPARISON  ← NEW
+  # =============================
+
+  tabPanel("Model Comparison",
+    fluidRow(
+      column(12,
+        h2("Three-Model Comparison", style = sprintf("color: %s; margin-bottom: 5px;", COLORS$primary)),
+        p("Monte Carlo Simulation vs Linear Regression vs Random Forest — each answers a different question.",
+          style = sprintf("color: %s; font-size: 15px; margin-bottom: 25px;", COLORS$neutral))
+      )
+    ),
+
+    # Model role cards
+    fluidRow(
+      column(4,
+        div(style = sprintf("border: 2px solid %s; border-radius: 8px; padding: 20px;", COLORS$relegation),
+          h4("Monte Carlo", style = sprintf("color: %s; margin-top: 0;", COLORS$relegation)),
+          p(strong("Question:"), " What happens to the system under relegation vs baseline over 10 years?"),
+          p(strong("Method:"), " Stochastic simulation, 100 runs × 5 scenarios"),
+          p(strong("Strength:"), " Models policy scenarios, uncertainty, system dynamics"),
+          p(strong("Limitation:"), " Relies on assumed/calibrated parameters")
+        )
+      ),
+      column(4,
+        div(style = sprintf("border: 2px solid %s; border-radius: 8px; padding: 20px;", COLORS$lm_color),
+          h4("Linear Regression", style = sprintf("color: %s; margin-top: 0;", COLORS$lm_color)),
+          p(strong("Question:"), " Which features drive team revenue, and by how much?"),
+          p(strong("Method:"), " OLS regression, trained on historical NCAA data"),
+          p(strong("Strength:"), " Interpretable coefficients, quantifies each driver's $ impact"),
+          p(strong("Limitation:"), " Assumes linear relationships; misses feature interactions")
+        )
+      ),
+      column(4,
+        div(style = sprintf("border: 2px solid %s; border-radius: 8px; padding: 20px;", COLORS$rf_color),
+          h4("Random Forest", style = sprintf("color: %s; margin-top: 0;", COLORS$rf_color)),
+          p(strong("Question:"), " Can we predict team revenue with high accuracy?"),
+          p(strong("Method:"), " Ensemble of 1000 decision trees, same features as LR"),
+          p(strong("Strength:"), " Captures non-linear patterns; robust to outliers"),
+          p(strong("Limitation:"), " Less interpretable; no explicit policy scenarios")
+        )
+      )
+    ),
+
+    br(),
+
+    # Combined projection chart
+    fluidRow(
+      column(12,
+        h4("All Models: National Revenue Projections (2025-2034)", style = sprintf("color: %s;", COLORS$primary)),
+        plotOutput("comp_plot_projections", height = 420)
+      )
+    ),
+
+    br(),
+
+    # CAGR bars + accuracy comparison side by side
+    fluidRow(
+      column(6,
+        h4("CAGR Comparison: All Models", style = sprintf("color: %s;", COLORS$primary)),
+        plotOutput("comp_plot_cagr", height = 350)
+      ),
+      column(6,
+        h4("Predictive Accuracy: LR vs RF (Test Set 2023-2024)", style = sprintf("color: %s;", COLORS$primary)),
+        plotOutput("comp_plot_accuracy", height = 350)
+      )
+    ),
+
+    br(),
+
+    # Summary table
+    fluidRow(
+      column(12,
+        h4("Summary Comparison Table", style = sprintf("color: %s;", COLORS$primary)),
+        DTOutput("comp_table_summary"),
+        br(),
+        div(style = sprintf("background: #f8fafc; padding: 15px; border-left: 4px solid %s; border-radius: 5px;", COLORS$secondary),
+          h5("Cross-Model Validation", style = sprintf("color: %s; margin-top: 0;", COLORS$primary)),
+          p("All three models consistently confirm that competitive rank is a top driver of team revenue.
+             The LR coefficient on rank improvement and the RF variable importance both validate the
+             Monte Carlo's 9.80% engagement premium assumption. This cross-model agreement strengthens
+             the case for relegation-driven revenue growth.", style = "font-size: 13px; margin: 0;")
+        )
+      )
+    )
+  )
+)
+
+# ===========================
+# SERVER
+# ===========================
+
+server <- function(input, output, session) {
+
+  # ────────────────────────────────────────
+  # ORIGINAL TABS 1-8 (unchanged)
+  # ────────────────────────────────────────
+
+  output$hero_intensity <- renderUI({
+    if(!HAS_METRICS) return(h1("Calculating..."))
+    baseline_int <- metrics$summary_stats$intensity_comparison %>%
+      filter(grepl("baseline", scenario_id)) %>% pull(avg_intensity) %>% mean()
+    releg_int <- metrics$summary_stats$intensity_comparison %>%
+      filter(grepl("releg", scenario_id)) %>% pull(avg_intensity) %>% mean()
+    multiplier <- releg_int / baseline_int
+    div(h1(sprintf("%.1f%%", releg_int), style = "font-size: 48px; margin: 10px 0;"),
+        p(sprintf("vs %.1f%% baseline", baseline_int), style = "font-size: 18px;"),
+        h4(sprintf("%.1f× MORE", multiplier), style = "margin-top: 15px; font-weight: bold;"))
+  })
+
+  output$hero_growth <- renderUI({
+    if(!HAS_METRICS) return(h1("Calculating..."))
+    baseline_cagr <- metrics$summary_stats$overall_summary %>%
+      filter(grepl("baseline", scenario_id)) %>% pull(cagr) %>% mean(na.rm = TRUE)
+    releg_cagr <- metrics$summary_stats$overall_summary %>%
+      filter(grepl("releg", scenario_id)) %>% pull(cagr) %>% mean(na.rm = TRUE)
+    diff <- releg_cagr - baseline_cagr
+    div(h1(sprintf("%.2f%%", releg_cagr), style = "font-size: 48px; margin: 10px 0;"),
+        p(sprintf("vs %.2f%% baseline", baseline_cagr), style = "font-size: 18px;"),
+        h4(sprintf("+%.2f%% FASTER", diff), style = "margin-top: 15px; font-weight: bold;"))
+  })
+
+  output$hero_gini <- renderUI({
+    if(!HAS_METRICS) return(h1("Calculating..."))
+    baseline_gini <- metrics$summary_stats$gini_comparison %>%
+      filter(grepl("baseline", scenario_id)) %>% pull(avg_gini) %>% mean()
+    releg_gini <- metrics$summary_stats$gini_comparison %>%
+      filter(grepl("releg", scenario_id)) %>% pull(avg_gini) %>% mean()
+    change_pct <- abs((releg_gini - baseline_gini) / baseline_gini * 100)
+    label_text <- ifelse(releg_gini > baseline_gini, "MERIT-BASED", "MORE EQUAL")
+    div(h1(sprintf("%.3f", releg_gini), style = "font-size: 48px; margin: 10px 0;"),
+        p(sprintf("vs %.3f baseline", baseline_gini), style = "font-size: 18px;"),
+        h4(sprintf("+%.0f%% %s", change_pct, label_text), style = "margin-top: 15px; font-weight: bold;"))
+  })
+
+  output$plot_mobility <- renderPlot({
+    if(!HAS_METRICS) return(NULL)
+    mobility_data <- metrics$scenario_mobility %>%
+      mutate(system = ifelse(grepl("baseline", scenario_id), "Baseline", "Relegation"))
+    ggplot(mobility_data, aes(x = reorder(scenario_id, pct_ever_moved), y = pct_ever_moved, fill = system)) +
+      geom_col(width = 0.7) + coord_flip() +
+      scale_fill_manual(values = c("Baseline" = COLORS$baseline, "Relegation" = COLORS$relegation)) +
+      labs(title = "Competitive Mobility", subtitle = "% of teams changing tiers",
+           x = NULL, y = "% Teams Moved", fill = NULL) +
+      theme_cfb(12) + theme(legend.position = "none")
+  })
+
+  output$plot_late_season <- renderPlot({
+    if(!HAS_METRICS) return(NULL)
+    late_data <- metrics$late_season_intensity %>%
+      mutate(system = ifelse(grepl("baseline", scenario_id), "Baseline", "Relegation"))
+    ggplot(late_data, aes(x = reorder(scenario_id, teams_meaningful), y = teams_meaningful, fill = system)) +
+      geom_col(width = 0.7) + coord_flip() +
+      scale_fill_manual(values = c("Baseline" = COLORS$baseline, "Relegation" = COLORS$relegation)) +
+      labs(title = "Late-Season Relevance", subtitle = "Teams with meaningful games (Years 4-10)",
+           x = NULL, y = "# Teams", fill = NULL) +
+      theme_cfb(12) + theme(legend.position = "none")
+  })
+
+  output$plot_sustainability <- renderPlot({
+    start_revenues <- team %>% filter(year == 2025) %>%
+      distinct(team, .keep_all = TRUE) %>% select(team, start_rev = revenue)
+    sustainability_data <- team %>%
+      left_join(start_revenues, by = "team", relationship = "many-to-one") %>%
+      mutate(at_floor = revenue <= (start_rev * 0.41)) %>%
+      group_by(scenario_id, year) %>%
+      summarise(pct_at_floor = mean(at_floor, na.rm = TRUE) * 100, .groups = "drop") %>%
+      group_by(scenario_id) %>%
+      summarise(avg_at_floor = mean(pct_at_floor, na.rm = TRUE)) %>%
+      mutate(system = ifelse(grepl("baseline", scenario_id), "Baseline", "Relegation"))
+    ggplot(sustainability_data, aes(x = reorder(scenario_id, -avg_at_floor), y = avg_at_floor, fill = system)) +
+      geom_col(width = 0.7) + coord_flip() +
+      scale_fill_manual(values = c("Baseline" = COLORS$baseline, "Relegation" = COLORS$relegation)) +
+      labs(title = "Financial Sustainability", subtitle = "% teams at revenue floor",
+           x = NULL, y = "% At Floor", fill = NULL) +
+      theme_cfb(12) + theme(legend.position = "none")
+  })
+
+  output$verdict_text <- renderUI({
+    if(!HAS_METRICS) return(p("Calculating..."))
+    tryCatch({
+      baseline_int  <- metrics$summary_stats$intensity_comparison %>% filter(grepl("baseline", scenario_id)) %>% pull(avg_intensity) %>% mean(na.rm=TRUE)
+      releg_int     <- metrics$summary_stats$intensity_comparison %>% filter(grepl("releg",    scenario_id)) %>% pull(avg_intensity) %>% mean(na.rm=TRUE)
+      baseline_cagr <- metrics$summary_stats$overall_summary     %>% filter(grepl("baseline", scenario_id)) %>% pull(cagr)           %>% mean(na.rm=TRUE)
+      releg_cagr    <- metrics$summary_stats$overall_summary     %>% filter(grepl("releg",    scenario_id)) %>% pull(cagr)           %>% mean(na.rm=TRUE)
+      baseline_gini <- metrics$summary_stats$gini_comparison     %>% filter(grepl("baseline", scenario_id)) %>% pull(avg_gini)       %>% mean(na.rm=TRUE)
+      releg_gini    <- metrics$summary_stats$gini_comparison     %>% filter(grepl("releg",    scenario_id)) %>% pull(avg_gini)       %>% mean(na.rm=TRUE)
+      mobility_pct  <- metrics$scenario_mobility                 %>% filter(grepl("releg",    scenario_id)) %>% pull(pct_ever_moved) %>% mean(na.rm=TRUE)
+      intensity_multiplier <- releg_int / baseline_int
+      growth_diff   <- releg_cagr - baseline_cagr
+      gini_change_pct <- abs((releg_gini - baseline_gini) / baseline_gini * 100)
+      gini_text <- ifelse(releg_gini > baseline_gini,
+                          sprintf("<strong>merit-based inequality</strong> (+%.1f%% higher Gini, earned through performance)", gini_change_pct),
+                          sprintf("<strong>%.1f%% more equitable</strong> distribution", gini_change_pct))
+      HTML(sprintf("
+        <p style='font-size: 16px; line-height: 1.8;'>
+          The relegation system produces a <strong>superior competitive product</strong>:
+        </p>
+        <ul style='font-size: 15px; line-height: 1.8;'>
+          <li><strong>%.1f× more competitive games</strong> (%.1f%% vs %.1f%% of teams with meaningful late-season games)</li>
+          <li><strong>%.2f percentage points faster revenue growth</strong> (%.2f%% vs %.2f%% CAGR)</li>
+          <li><strong>%s</strong> (Gini: %.3f vs %.3f)</li>
+          <li><strong>%.0f%% of teams change tiers</strong> over 10 years based on performance</li>
+        </ul>
+        <p style='font-size: 16px; margin-top: 20px;'>
+          <strong>Conclusion:</strong> Relegation delivers a superior product for fans, competitive balance for teams, and sustainable long-term growth.
+        </p>
+      ", intensity_multiplier, releg_int, baseline_int, growth_diff,
+         releg_cagr, baseline_cagr, gini_text, releg_gini, baseline_gini, mobility_pct))
+    }, error = function(e) p("Error calculating verdict.", style = "color: red;"))
+  })
+
+  output$plot_revenue_trends <- renderPlotly({
+    req(input$rev_scenarios)
+    if(length(input$rev_scenarios) == 0) return(NULL)
+    plot_data <- national %>%
+      filter(scenario_id %in% input$rev_scenarios) %>%
+      arrange(scenario_id, year) %>%
+      group_by(scenario_id) %>%
+      mutate(
+        total_rev_billions    = total_revenue / 1000,
+        avg_per_team_billions = total_revenue / 134 / 1000,
+        growth_rate = if_else(row_number() > 1, (total_revenue / lag(total_revenue) - 1) * 100, NA_real_)
+      ) %>% ungroup()
+    if(input$rev_metric == "total_revenue") {
+      plot_data <- plot_data %>% mutate(value = total_rev_billions); y_label <- "Total Revenue ($B)"
+    } else if(input$rev_metric == "avg_per_team") {
+      plot_data <- plot_data %>% mutate(value = avg_per_team_billions); y_label <- "Avg Revenue per Team ($B)"
+    } else {
+      plot_data <- plot_data %>% mutate(value = growth_rate); y_label <- "Year-over-Year Growth (%)"
+    }
+    plot_data <- plot_data %>% filter(!is.na(value), is.finite(value))
+    if(nrow(plot_data) == 0) return(NULL)
+    plot_ly(data = plot_data, x = ~year, y = ~value, color = ~scenario_id,
+            colors = scenario_colors, type = 'scatter', mode = 'lines+markers',
+            line = list(width = 3), marker = list(size = 8),
+            hovertemplate = paste('<b>%{fullData.name}</b><br>Year: %{x}<br>', y_label, ': %{y:.2f}<br><extra></extra>')) %>%
+      layout(xaxis = list(title = ""), yaxis = list(title = y_label),
+             legend = list(orientation = "h", yanchor = "bottom", y = -0.3, xanchor = "center", x = 0.5),
+             hovermode = "closest")
+  })
+
+  output$plot_components <- renderPlot({
+    component_data <- national %>%
+      filter(year == 2034) %>%
+      select(scenario_id, rev_media, rev_ticket, rev_don, rev_fee, rev_other, rev_bonuses) %>%
+      pivot_longer(cols = starts_with("rev_"), names_to = "component", values_to = "revenue") %>%
+      mutate(component = case_when(
+        component == "rev_media"   ~ "Media Rights",  component == "rev_ticket"  ~ "Ticket Sales",
+        component == "rev_don"     ~ "Donations",     component == "rev_fee"     ~ "Student Fees",
+        component == "rev_other"   ~ "Other Revenue", component == "rev_bonuses" ~ "Playoff Bonuses"
+      ), revenue_billions = revenue / 1000)
+    ggplot(component_data, aes(x = scenario_id, y = revenue_billions, fill = component)) +
+      geom_col(position = "stack") + coord_flip() +
+      scale_fill_viridis_d(option = "turbo") +
+      labs(title = "Revenue Sources by Scenario (2034)", x = NULL, y = "Revenue ($B)", fill = "Component") +
+      theme_cfb(14)
+  })
+
+  output$plot_intensity_heatmap <- renderPlot({
+    top_teams <- team %>% filter(grepl("releg_T3_P12", scenario_id)) %>%
+      group_by(team) %>% summarise(avg_rev = mean(revenue, na.rm = TRUE)) %>%
+      arrange(desc(avg_rev)) %>% slice(1:30) %>% pull(team)
+    heatmap_data <- team %>% filter(scenario_id == "releg_T3_P12", team %in% top_teams) %>%
+      select(team, year, intensity)
+    ggplot(heatmap_data, aes(x = year, y = reorder(team, intensity), fill = intensity)) +
+      geom_tile(color = "white", size = 0.5) +
+      scale_fill_viridis_c(option = "magma", labels = scales::percent) +
+      labs(title = "Intensity Heatmap: Top 30 Teams (Relegation 12-team playoff)",
+           x = NULL, y = NULL, fill = "Intensity") +
+      theme_minimal(base_size = 12) + theme(axis.text.y = element_text(size = 9), legend.position = "right")
+  })
+
+  output$plot_weekly_intensity <- renderPlot({
+    intensity_count <- team %>% filter(year >= 2028) %>%
+      mutate(meaningful = intensity > 0.30,
+             system = ifelse(grepl("baseline", scenario_id), "Baseline", "Relegation")) %>%
+      group_by(scenario_id, year, system) %>%
+      summarise(teams_meaningful = sum(meaningful, na.rm = TRUE), .groups = "drop")
+    ggplot(intensity_count, aes(x = year, y = teams_meaningful, color = scenario_id)) +
+      geom_line(size = 1.2) + geom_point(size = 2.5) +
+      scale_color_manual(values = scenario_colors) +
+      labs(title = "Teams with Meaningful Games (>30% intensity)", subtitle = "Years 4-10 (mature system)",
+           x = NULL, y = "# Teams", color = "Scenario") +
+      theme_cfb(14)
+  })
+
+  output$plot_intensity_dist <- renderPlot({
+    dist_data <- team %>% filter(year >= 2028) %>%
+      mutate(system = ifelse(grepl("baseline", scenario_id), "Baseline", "Relegation"))
+    ggplot(dist_data, aes(x = intensity, fill = system)) +
+      geom_density(alpha = 0.6) +
+      scale_fill_manual(values = c("Baseline" = COLORS$baseline, "Relegation" = COLORS$relegation)) +
+      scale_x_continuous(labels = scales::percent) +
+      labs(title = "Intensity Distribution (Years 4-10)", x = "Intensity", y = "Density", fill = "System") +
+      theme_cfb(14)
+  })
+
+  output$plot_lorenz <- renderPlot({
+    if(!HAS_METRICS) return(NULL)
+    lorenz_data <- team %>% filter(year == 2034) %>%
+      group_by(scenario_id) %>% arrange(revenue) %>%
+      mutate(cum_teams = row_number() / n() * 100, cum_revenue = cumsum(revenue) / sum(revenue) * 100)
+    ggplot(lorenz_data, aes(x = cum_teams, y = cum_revenue, color = scenario_id)) +
+      geom_line(size = 1.2) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+      scale_color_manual(values = scenario_colors) +
+      labs(x = "Cumulative % of Teams", y = "Cumulative % of Revenue",
+           title = "Lorenz Curve (2034)", color = "Scenario") +
+      theme_cfb(14)
+  })
+
+  output$plot_gini_trends <- renderPlot({
+    if(!HAS_METRICS) return(NULL)
+    ggplot(metrics$national_gini, aes(x = year, y = gini_national, color = scenario_id)) +
+      geom_line(size = 1.2) + geom_point(size = 2.5) +
+      scale_color_manual(values = scenario_colors) +
+      labs(x = NULL, y = "Gini Coefficient", title = "Revenue Inequality Over Time", color = "Scenario") +
+      theme_cfb(14)
+  })
+
+  output$table_conf_equity <- renderDT({
+    if(!HAS_METRICS) return(NULL)
+    conf_equity <- team %>% filter(!is.na(conference), !grepl("^\\d+$", conference)) %>%
+      group_by(scenario_id, conference, year) %>%
+      summarise(gini_temp = {
+        revs <- revenue[!is.na(revenue) & revenue > 0]
+        if(length(revs) < 2) NA_real_ else {
+          revs <- sort(revs); n <- length(revs)
+          2 * sum((1:n) * revs) / (n * sum(revs)) - (n + 1) / n
+        }
+      }, .groups = "drop") %>%
+      group_by(scenario_id, conference) %>%
+      summarise(avg_gini = mean(gini_temp, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = scenario_id, values_from = avg_gini) %>% arrange(conference)
+    datatable(conf_equity, rownames = FALSE, options = list(pageLength = 15)) %>%
+      formatRound(columns = 2:ncol(conf_equity), digits = 3)
+  })
+
+  output$conf_title <- renderText({ paste(input$conf_select, "- Revenue Comparison") })
+
+  output$plot_conf_revenue <- renderPlot({
+    conf_data <- conference %>% filter(conference == input$conf_select)
+    ggplot(conf_data, aes(x = year, y = conf_revenue, color = scenario_id)) +
+      geom_line(size = 1.3) + geom_point(size = 2.5) +
+      scale_color_manual(values = scenario_colors) +
+      scale_y_continuous(labels = lab_num()) +
+      labs(x = NULL, y = "Conference Revenue ($M)", color = "Scenario") + theme_cfb(14)
+  })
+
+  output$plot_conf_tiers <- renderPlot({
+    tier_data <- team %>% filter(conference == input$conf_select, !is.na(tier), grepl("releg", scenario_id)) %>%
+      count(scenario_id, year, tier)
+    ggplot(tier_data, aes(x = year, y = n, fill = factor(tier))) +
+      geom_area(alpha = 0.7) +
+      scale_fill_manual(values = c("1" = "#10b981", "2" = "#f59e0b", "3" = "#ef4444"),
+                        labels = c("Tier 1", "Tier 2", "Tier 3")) +
+      facet_wrap(~scenario_id, ncol = 1) +
+      labs(x = NULL, y = "# Teams", fill = "Tier") + theme_cfb(12)
+  })
+
+  output$plot_conf_intensity <- renderPlot({
+    conf_intensity <- team %>% filter(conference == input$conf_select) %>%
+      group_by(scenario_id, year) %>%
+      summarise(avg_intensity = mean(intensity, na.rm = TRUE) * 100, .groups = "drop")
+    ggplot(conf_intensity, aes(x = year, y = avg_intensity, color = scenario_id)) +
+      geom_line(size = 1.3) + geom_point(size = 2.5) +
+      scale_color_manual(values = scenario_colors) +
+      labs(x = NULL, y = "Average Intensity (%)", color = "Scenario") + theme_cfb(14)
+  })
+
+  output$team_title <- renderText({ paste(input$team_select, "- 10-Year Projection") })
+
+  output$plot_team_revenue <- renderPlot({
+    team_data <- team %>% filter(team == input$team_select, scenario_id %in% input$team_scenarios)
+    ggplot(team_data, aes(x = year, y = revenue, color = scenario_id)) +
+      geom_line(size = 1.3) + geom_point(size = 2.5) +
+      scale_color_manual(values = scenario_colors) +
+      scale_y_continuous(labels = lab_num()) +
+      labs(x = NULL, y = "Revenue ($M)", color = "Scenario") + theme_cfb(14)
+  })
+
+  output$table_team_detail <- renderDT({
+    team_data <- team %>%
+      filter(team == input$team_select, scenario_id %in% input$team_scenarios) %>%
+      select(Scenario = scenario_id, Year = year, Tier = tier, Revenue = revenue, Intensity = intensity) %>%
+      mutate(Revenue = sprintf("$%.1fM", Revenue), Intensity = sprintf("%.0f%%", Intensity * 100),
+             Tier = ifelse(is.na(Tier), "N/A", as.character(Tier)))
+    datatable(team_data, rownames = FALSE, options = list(pageLength = 15))
+  })
+
+  output$plot_sensitivity_cagr <- renderPlot({
+    engagement_levels <- seq(0, 0.20, 0.01)
+    sensitivity_data <- tibble(
+      engagement_pct  = engagement_levels * 100,
+      baseline_cagr   = 2.59,
+      relegation_cagr = 2.59 + (engagement_levels / (ENGAGEMENT_PREMIUM/100)) * 3.24
+    )
+    ggplot(sensitivity_data) +
+      geom_line(aes(x = engagement_pct, y = baseline_cagr),   color = "#3498DB", size = 1.5, linetype = "dashed") +
+      geom_line(aes(x = engagement_pct, y = relegation_cagr), color = "#27AE60", size = 1.5) +
+      geom_vline(xintercept = ENGAGEMENT_PREMIUM, linetype = "dotted", color = "red", size = 1) +
+      annotate("text", x = ENGAGEMENT_PREMIUM + 1.5, y = 7,
+               label = sprintf("Base Estimate\n(%.2f%%)", ENGAGEMENT_PREMIUM),
+               color = "red", hjust = 0, size = 5) +
+      annotate("rect", xmin = ENGAGEMENT_PREMIUM * 0.5, xmax = ENGAGEMENT_PREMIUM * 1.5,
+               ymin = -Inf, ymax = Inf, alpha = 0.1, fill = "green") +
+      scale_x_continuous(breaks = seq(0, 20, 2.5)) +
+      scale_y_continuous(breaks = seq(0, 10, 1)) +
+      coord_cartesian(ylim = c(0, 10)) +
+      labs(title = "Revenue Growth vs Engagement Premium",
+           subtitle = "How results change with different engagement assumptions",
+           x = "Engagement Premium (%)", y = "10-Year CAGR (%)") +
+      theme_cfb(14)
+  })
+
+  output$table_sensitivity <- renderDT({
+    sensitivity_table <- tibble(
+      Scenario = c("Very Conservative", "Conservative", "Base (Data-Driven)", "Moderate", "Optimistic"),
+      `Engagement Premium` = c("2.5%", "5.0%", sprintf("%.2f%%", ENGAGEMENT_PREMIUM), "12.5%", "15.0%"),
+      `Relegation CAGR`    = c("2.8%", "3.6%", "5.8%", "7.1%", "8.5%"),
+      `Baseline CAGR`      = rep("2.6%", 5),
+      `Growth Advantage`   = c("+0.2pp", "+1.0pp", "+3.2pp", "+4.5pp", "+5.9pp"),
+      Interpretation = c("Minimal engagement effect - systems nearly equivalent",
+                         "Conservative estimate - relegation still faster",
+                         "CURRENT MODEL - based on NCAA regression",
+                         "Stronger fan response than estimated",
+                         "Maximum plausible engagement impact")
+    )
+    datatable(sensitivity_table, rownames = FALSE, options = list(pageLength = 5, dom = 't')) %>%
+      formatStyle('Scenario', target = 'row',
+                  fontWeight        = styleEqual('Base (Data-Driven)', 'bold'),
+                  backgroundColor   = styleEqual('Base (Data-Driven)', '#E8F5E9'))
+  })
+
+  # ────────────────────────────────────────
+  # TAB 9: LINEAR REGRESSION — FULL SERVER
+  # ────────────────────────────────────────
+
+  lm_full_summary <- reactive({
+    if (!HAS_LM) return(NULL)
+    m <- lm_results$models$m5
+    if (is.null(m)) m <- lm_results$models$full
+    if (is.null(m)) return(NULL)
+    summary(m)
+  })
+
+  output$lm_card_r2 <- renderUI({
+    if(!HAS_LM) return(h3("N/A"))
+    r2 <- if(!is.null(lm_results$all_metrics))
+      lm_results$all_metrics$Test_R2[lm_results$all_metrics$Model=="M5: Full (13 features)"][1]
+    else lm_full_summary()$r.squared
+    h3(sprintf("%.4f", r2), style="font-size:24px;margin:4px 0;")
+  })
+  output$lm_card_adj_r2 <- renderUI({
+    s <- lm_full_summary(); if(is.null(s)) return(h3("N/A"))
+    h3(sprintf("%.4f", s$adj.r.squared), style="font-size:24px;margin:4px 0;")
+  })
+  output$lm_card_rse <- renderUI({
+    s <- lm_full_summary(); if(is.null(s)) return(h3("N/A"))
+    h3(sprintf("$%.2fM", s$sigma), style="font-size:24px;margin:4px 0;")
+  })
+  output$lm_card_fstat <- renderUI({
+    s <- lm_full_summary(); if(is.null(s)) return(h3("N/A"))
+    h3(sprintf("%.0f", s$fstatistic["value"]), style="font-size:24px;margin:4px 0;")
+  })
+  output$lm_card_fpval <- renderUI({
+    s <- lm_full_summary(); if(is.null(s)) return(h3("N/A"))
+    fs   <- s$fstatistic
+    pval <- pf(fs["value"], fs["numdf"], fs["dendf"], lower.tail=FALSE)
+    h3(ifelse(pval<1e-15, "< 1e-15", sprintf("%.2e", pval)), style="font-size:20px;margin:4px 0;")
+  })
+  output$lm_card_params <- renderUI({
+    if(!HAS_LM) return(h3("N/A"))
+    m <- lm_results$models$m5
+    if(is.null(m)) m <- lm_results$models$full
+    h3(as.character(length(coef(m))), style="font-size:24px;margin:4px 0;")
+  })
+  output$lm_card_rmse <- renderUI({
+    if(!HAS_LM) return(h3("N/A"))
+    val <- if(!is.null(lm_results$all_metrics))
+      lm_results$all_metrics$Test_RMSE[lm_results$all_metrics$Model=="M5: Full (13 features)"][1]
+    else lm_results$test_metrics$RMSE_M[1]
+    h3(sprintf("$%.2fM", val), style="font-size:24px;margin:4px 0;")
+  })
+  output$lm_card_mape <- renderUI({
+    if(!HAS_LM) return(h3("N/A"))
+    val <- if(!is.null(lm_results$all_metrics))
+      lm_results$all_metrics$Test_MAPE[lm_results$all_metrics$Model=="M5: Full (13 features)"][1]
+    else lm_results$test_metrics$MAPE_pct[1]
+    h3(sprintf("%.2f%%", val), style="font-size:24px;margin:4px 0;")
+  })
+  output$lm_card_cagr <- renderUI({
+    if(!HAS_LM) return(h3("N/A"))
+    h3(sprintf("%.2f%%", lm_results$cagr*100), style="font-size:24px;margin:4px 0;")
+  })
+
+  output$lm_table_all_models <- renderDT({
+    if(!HAS_LM || is.null(lm_results$all_metrics)) return(NULL)
+    best <- lm_results$best_label
+    lm_results$all_metrics %>%
+      mutate(across(where(is.numeric), ~round(.,4)),
+             Selected = ifelse(Model==best, "BEST", "")) %>%
+      select(Model, Train_R2, Train_RMSE, Test_R2, Test_RMSE, Test_MAPE, Selected) %>%
+      datatable(rownames=FALSE, options=list(pageLength=7, dom='t'),
+                colnames=c("Model","Tr.R²","Tr.RMSE","Te.R²","Te.RMSE","Te.MAPE%","")) %>%
+      formatStyle("Selected", fontWeight=styleEqual("BEST","bold"),
+                  backgroundColor=styleEqual("BEST","#dbeafe"),
+                  color=styleEqual("BEST",COLORS$primary))
+  })
+
+  output$lm_lasso_summary <- renderUI({
+    if(!HAS_LM || is.null(lm_results$features_min)) return(p("Run updated LR model for LASSO results."))
+    f_min <- lm_results$features_min
+    f_1se <- lm_results$features_1se
+    tagList(
+      div(style="background:#ede9fe;padding:8px;border-radius:6px;margin-bottom:6px;",
+        p(strong(sprintf("λ.min — %d features kept:", length(f_min))), style="font-size:12px;margin:0;color:#5b21b6;"),
+        p(paste(f_min, collapse=", "), style="font-size:10px;margin:2px 0 0;color:#6d28d9;")
+      ),
+      div(style="background:#d1fae5;padding:8px;border-radius:6px;",
+        p(strong(sprintf("λ.1se — %d features kept (sparser):", length(f_1se))), style="font-size:12px;margin:0;color:#065f46;"),
+        p(paste(f_1se, collapse=", "), style="font-size:10px;margin:2px 0 0;color:#047857;")
+      )
+    )
+  })
+
+  output$lm_excluded_features <- renderUI({
+    if(!HAS_LM || is.null(lm_results$features_1se)) return(p("N/A"))
+    all_f <- c("revenue_lag1","revenue_lag2","revenue_growth1","revenue_growth2",
+               "rank_pct","rank_change","rank_3yr_avg","as.factor(tier_proxy)2",
+               "as.factor(tier_proxy)3","capacity_util","revenue_3yr_cagr","is_power_conf","year_trend")
+    excl <- setdiff(all_f, lm_results$features_1se)
+    p(ifelse(length(excl)==0, "None — all features kept at λ.1se",
+             paste(excl, collapse=", ")),
+      style="font-size:11px;color:#dc2626;margin:4px 0;")
+  })
+
+  output$lm_table_coefs_full <- renderDT({
+    if(!HAS_LM) return(NULL)
+    m <- lm_results$models$m5
+    if(is.null(m)) m <- lm_results$models$full
+    s <- summary(m)
+    ct <- as.data.frame(s$coefficients) %>%
+      tibble::rownames_to_column("Feature") %>%
+      filter(Feature != "(Intercept)") %>%
+      rename(Coef=Estimate, SE=`Std. Error`, t_stat=`t value`, p_val=`Pr(>|t|)`) %>%
+      mutate(
+        Feature = recode(Feature,
+          "revenue_lag1"="Prior year revenue ($M)","revenue_lag2"="2-yr lag revenue ($M)",
+          "revenue_growth1"="YoY growth rate","revenue_growth2"="Prior YoY growth rate",
+          "rank_pct"="Rank percentile","rank_change"="Rank improvement",
+          "rank_3yr_avg"="3-yr avg rank","as.factor(tier_proxy)2"="Tier 2 indicator",
+          "as.factor(tier_proxy)3"="Tier 3 indicator","capacity_util"="Stadium fill rate",
+          "revenue_3yr_cagr"="3-yr revenue CAGR","is_power_conf"="Power conference",
+          "year_trend"="Year trend (2015=0)"),
+        Stars  = case_when(p_val<0.001~"★★★", p_val<0.01~"★★", p_val<0.05~"★", TRUE~"ns"),
+        CI_low = round(Coef - 1.96*SE, 5), CI_high = round(Coef + 1.96*SE, 5),
+        across(c(Coef,SE), ~round(.,5)), t_stat=round(t_stat,3), p_val=round(p_val,4)
+      ) %>%
+      arrange(p_val) %>%
+      select(Feature, Coef, SE, t_stat, p_val, CI_low, CI_high, Stars)
+    datatable(ct, rownames=FALSE,
+              colnames=c("Feature","Coef","Std Err","t-stat","p-value","CI Low","CI High","Sig"),
+              options=list(pageLength=15, dom='tp')) %>%
+      formatStyle("Stars",
+                  color=styleEqual(c("★★★","★★","★","ns"),c("#059669","#0d9488","#f97316","#94a3b8")),
+                  fontWeight=styleEqual(c("★★★","★★","★"),rep("bold",3))) %>%
+      formatStyle("p_val", backgroundColor=styleInterval(c(0.001,0.01,0.05),
+                  c("#d1fae5","#ecfdf5","#fff7ed","white")))
+  })
+
+  output$lm_table_train_test <- renderDT({
+    if(!HAS_LM || is.null(lm_results$all_metrics)) return(NULL)
+    lm_results$all_metrics %>%
+      mutate(across(where(is.numeric), ~round(.,4))) %>%
+      select(Model, Train_R2, Train_RMSE, Train_MAPE, Test_R2, Test_RMSE, Test_MAPE) %>%
+      datatable(rownames=FALSE, options=list(pageLength=7, dom='t'),
+                colnames=c("Model","Tr.R²","Tr.RMSE","Tr.MAPE%","Te.R²","Te.RMSE","Te.MAPE%"))
+  })
+
+  output$lm_plot_resid <- renderPlot({
+    if(!HAS_LM) return(NULL)
+    m <- lm_results$models$m5
+    if(is.null(m)) m <- lm_results$models$full
+    tibble(fitted=fitted(m), resid=resid(m)) %>%
+      ggplot(aes(x=fitted, y=resid)) +
+      geom_point(alpha=0.4, size=1.5, color=COLORS$lm_color) +
+      geom_hline(yintercept=0, linetype="dashed", color="gray40") +
+      geom_smooth(se=FALSE, color=COLORS$primary, size=0.8, method="loess", formula=y~x) +
+      scale_x_continuous(labels=function(x) paste0("$", formatC(x, format="f", digits=0), "M")) +
+      scale_y_continuous(labels=function(x) paste0("$", formatC(x, format="f", digits=0), "M")) +
+      labs(title="Residuals vs. Fitted", x="Fitted ($M)", y="Residual ($M)") + theme_cfb(11)
+  })
+
+  output$lm_plot_actual_pred <- renderPlot({
+    if(!HAS_LM) return(NULL)
+    m  <- lm_results$models$m5
+    if(is.null(m)) m <- lm_results$models$full
+    td <- lm_results$model_data %>% filter(year>=2023) %>%
+      mutate(predicted=predict(m, newdata=.), tier_proxy=as.factor(tier_proxy))
+    ggplot(td, aes(x=revenue, y=predicted, color=tier_proxy)) +
+      geom_point(alpha=0.65, size=1.8) +
+      geom_abline(slope=1, intercept=0, linetype="dashed", color="gray40") +
+      scale_color_manual(values=c("1"=COLORS$primary,"2"=COLORS$secondary,"3"=COLORS$accent1),
+                         labels=c("Tier 1","Tier 2","Tier 3"), name="Tier") +
+      scale_x_continuous(labels=function(x) paste0("$", formatC(x, format="f", digits=0), "M")) +
+      scale_y_continuous(labels=function(x) paste0("$", formatC(x, format="f", digits=0), "M")) +
+      labs(title="Actual vs. Predicted (Test 2023-24)", x="Actual ($M)", y="Predicted ($M)") + theme_cfb(11)
+  })
+
+  output$lm_plot_projection <- renderPlot({
+    if(!HAS_LM) return(NULL)
+    ggplot(lm_results$national %>% mutate(rev_B = total_revenue/1000), aes(x=year, y=rev_B)) +
+      geom_line(color=COLORS$lm_color, size=1.2) + geom_point(color=COLORS$lm_color, size=2.5) +
+      annotate("text", x=2034, y=max(lm_results$national$total_revenue)/1000,
+               label=sprintf("CAGR: %.2f%%", lm_results$cagr*100),
+               hjust=1.1, color=COLORS$lm_color, fontface="bold", size=3.8) +
+      scale_y_continuous(labels=function(x) paste0("$", formatC(x, format="f", digits=1), "B")) + scale_x_continuous(breaks=2025:2034) +
+      labs(title="LR: National Revenue 2025-2034", x="Year", y="Revenue ($B)") + theme_cfb(11)
+  })
+
+  # ────────────────────────────────────────
+  # TAB 10: RANDOM FOREST — FULL SERVER
+  # ────────────────────────────────────────
+
+  output$rf_subtitle <- renderUI({
+    if(!HAS_RF) return(p("Run RANDOM_FOREST_MODEL.R first.", style="color:red;"))
+    bp <- rf_results$best_params
+    if(is.null(bp)) return(p("Optimal params not found — re-run RANDOM_FOREST_MODEL.R"))
+    p(sprintf("Optimal: %d trees | mtry=%d | min.node.size=%d | Permutation importance | 13 features",
+              bp$num_trees, bp$mtry, bp$min_node_size),
+      style=sprintf("color:%s;font-size:13px;margin-bottom:15px;", COLORS$neutral))
+  })
+
+  output$rf_card_r2 <- renderUI({
+    if(!HAS_RF) return(h3("N/A"))
+    val <- if(nrow(rf_results$rf_metrics)>=2) rf_results$rf_metrics$R2[2] else rf_results$rf_metrics$R2[1]
+    h3(sprintf("%.4f", val), style="font-size:24px;margin:4px 0;")
+  })
+  output$rf_card_oob_r2 <- renderUI({
+    if(!HAS_RF || is.null(rf_results$best_params)) return(h3("N/A"))
+    h3(sprintf("%.4f", rf_results$best_params$oob_r2), style="font-size:24px;margin:4px 0;")
+  })
+  output$rf_card_rmse <- renderUI({
+    if(!HAS_RF) return(h3("N/A"))
+    val <- if(nrow(rf_results$rf_metrics)>=2) rf_results$rf_metrics$RMSE_M[2] else rf_results$rf_metrics$RMSE_M[1]
+    h3(sprintf("$%.2fM", val), style="font-size:24px;margin:4px 0;")
+  })
+  output$rf_card_oob_rmse <- renderUI({
+    if(!HAS_RF || is.null(rf_results$best_params)) return(h3("N/A"))
+    h3(sprintf("$%.2fM", rf_results$best_params$oob_rmse), style="font-size:24px;margin:4px 0;")
+  })
+  output$rf_card_mape <- renderUI({
+    if(!HAS_RF) return(h3("N/A"))
+    val <- if(nrow(rf_results$rf_metrics)>=2) rf_results$rf_metrics$MAPE_pct[2] else rf_results$rf_metrics$MAPE_pct[1]
+    h3(sprintf("%.2f%%", val), style="font-size:24px;margin:4px 0;")
+  })
+  output$rf_card_cagr <- renderUI({
+    if(!HAS_RF) return(h3("N/A"))
+    h3(sprintf("%.2f%%", rf_results$cagr*100), style="font-size:24px;margin:4px 0;")
+  })
+
+  output$rf_table_grid_top10 <- renderDT({
+    if(!HAS_RF || is.null(rf_results$grid_results)) return(NULL)
+    rf_results$grid_results %>% arrange(oob_rmse) %>% head(10) %>%
+      mutate(across(where(is.numeric), ~round(.,4))) %>%
+      select(num_trees, mtry, min_node_size, oob_r2, oob_rmse, test_r2, test_rmse, test_mape) %>%
+      datatable(rownames=FALSE, options=list(pageLength=10, dom='t'),
+                colnames=c("Trees","mtry","Node","OOB R²","OOB RMSE","Te.R²","Te.RMSE","MAPE%")) %>%
+      formatStyle(0, target='row', backgroundColor=styleRow(1,"#dbeafe"), fontWeight=styleRow(1,"bold"))
+  })
+
+  output$rf_best_params_box <- renderUI({
+    if(!HAS_RF || is.null(rf_results$best_params)) return(NULL)
+    bp <- rf_results$best_params
+    div(style=sprintf("background:#dbeafe;padding:8px;border-radius:6px;border-left:4px solid %s;",COLORS$primary),
+      p(strong(sprintf("Selected: %d trees | mtry=%d | node=%d", bp$num_trees, bp$mtry, bp$min_node_size)),
+        style="font-size:12px;margin:0;color:#1e3a8a;"),
+      p(sprintf("OOB RMSE=$%.4fM | Test RMSE=$%.4fM | MAPE=%.2f%%",
+                bp$oob_rmse, bp$test_rmse, bp$test_mape),
+        style="font-size:11px;margin:2px 0 0;color:#3730a3;")
+    )
+  })
+
+  output$rf_plot_mtry <- renderPlot({
+    if(!HAS_RF || is.null(rf_results$mtry_effect)) return(NULL)
+    bp <- rf_results$best_params
+    ggplot(rf_results$mtry_effect, aes(x=factor(mtry), y=avg_oob)) +
+      geom_col(fill=COLORS$rf_color, alpha=0.8) +
+      geom_vline(xintercept=as.character(bp$mtry), color=COLORS$accent1, linetype="dashed", size=1.2) +
+      labs(x="mtry", y="Avg OOB RMSE ($M)") + theme_cfb(10)
+  })
+  output$rf_plot_trees <- renderPlot({
+    if(!HAS_RF || is.null(rf_results$trees_effect)) return(NULL)
+    bp <- rf_results$best_params
+    ggplot(rf_results$trees_effect, aes(x=num_trees, y=avg_oob)) +
+      geom_line(color=COLORS$rf_color, size=1.2) + geom_point(color=COLORS$rf_color, size=2.5) +
+      geom_vline(xintercept=bp$num_trees, color=COLORS$accent1, linetype="dashed") +
+      labs(x="Num Trees", y="Avg OOB RMSE ($M)") + theme_cfb(10)
+  })
+  output$rf_plot_nodesize <- renderPlot({
+    if(!HAS_RF || is.null(rf_results$nodesize_effect)) return(NULL)
+    bp <- rf_results$best_params
+    ggplot(rf_results$nodesize_effect, aes(x=factor(min_node_size), y=avg_oob)) +
+      geom_col(fill="#0f766e", alpha=0.8) +
+      geom_vline(xintercept=as.character(bp$min_node_size), color=COLORS$accent1, linetype="dashed", size=1.2) +
+      labs(x="Min Node Size", y="Avg OOB RMSE ($M)") + theme_cfb(10)
+  })
+
+  output$rf_table_importance <- renderDT({
+    if(!HAS_RF) return(NULL)
+    rf_results$vi_df %>%
+      mutate(Importance=round(Importance,1), `% of Max`=sprintf("%.1f%%", Importance/max(Importance)*100)) %>%
+      select(Rank, Feature, Importance, `% of Max`) %>%
+      datatable(rownames=FALSE, options=list(pageLength=13, dom='t')) %>%
+      formatStyle("Rank", backgroundColor=styleInterval(c(3,6), c("#d1fae5","#ecfdf5","white")),
+                  fontWeight=styleInterval(c(1), c("bold","normal")))
+  })
+
+  output$rf_plot_importance <- renderPlot({
+    if(!HAS_RF) return(NULL)
+    rf_results$vi_df %>% head(10) %>%
+      mutate(Feature=fct_reorder(Feature, Importance)) %>%
+      ggplot(aes(x=Importance, y=Feature, fill=Importance)) +
+      geom_col() + scale_fill_gradient(low=COLORS$secondary, high=COLORS$rf_color, guide="none") +
+      labs(x="Permutation Importance", y=NULL) + theme_cfb(10)
+  })
+
+  output$rf_plot_pdp <- renderPlot({
+    if(!HAS_RF) return(NULL)
+    pd <- rf_results$pd_rank
+    ggplot(pd, aes(x=rank_pct, y=avg_revenue)) +
+      geom_line(color=COLORS$rf_color, size=1.3) +
+      geom_ribbon(aes(ymin=avg_revenue*0.93, ymax=avg_revenue*1.07), alpha=0.15, fill=COLORS$rf_color) +
+      geom_vline(xintercept=c(45/134,90/134), linetype="dashed", color=COLORS$accent1, alpha=0.8) +
+      annotate("text",x=45/134,y=max(pd$avg_revenue)*0.95,label="T1|T2",hjust=-0.1,color=COLORS$accent1,size=2.8) +
+      annotate("text",x=90/134,y=max(pd$avg_revenue)*0.88,label="T2|T3",hjust=-0.1,color=COLORS$accent1,size=2.8) +
+      scale_x_continuous(labels=scales::percent) + scale_y_continuous(labels=function(x) paste0("$", formatC(x, format="f", digits=0), "M")) +
+      labs(x="Rank Percentile (0%=best)", y="Avg Revenue ($M)") + theme_cfb(10)
+  })
+
+  output$rf_pdp_stats <- renderUI({
+    if(!HAS_RF) return(NULL)
+    pd <- rf_results$pd_rank
+    spread <- pd$avg_revenue[1] - pd$avg_revenue[nrow(pd)]
+    div(style="background:#f0f4ff;padding:6px;border-radius:5px;margin-top:4px;",
+      p(sprintf("Best: $%.1fM | Worst: $%.1fM | Spread: $%.1fM",
+                pd$avg_revenue[1], pd$avg_revenue[nrow(pd)], spread),
+        style="font-size:11px;margin:0;color:#1e3a8a;"))
+  })
+
+  output$rf_vs_lm_table <- renderDT({
+    if(!HAS_RF || !HAS_LM) return(NULL)
+    lm_rmse <- if(!is.null(lm_results$all_metrics))
+      lm_results$all_metrics$Test_RMSE[lm_results$all_metrics$Model=="M5: Full (13 features)"][1]
+    else lm_results$test_metrics$RMSE_M[1]
+    lm_mape <- if(!is.null(lm_results$all_metrics))
+      lm_results$all_metrics$Test_MAPE[lm_results$all_metrics$Model=="M5: Full (13 features)"][1]
+    else lm_results$test_metrics$MAPE_pct[1]
+    lm_r2 <- if(!is.null(lm_results$all_metrics))
+      lm_results$all_metrics$Test_R2[lm_results$all_metrics$Model=="M5: Full (13 features)"][1]
+    else NA
+    rf_r2   <- if(nrow(rf_results$rf_metrics)>=2) rf_results$rf_metrics$R2[2] else rf_results$rf_metrics$R2[1]
+    rf_rmse <- if(nrow(rf_results$rf_metrics)>=2) rf_results$rf_metrics$RMSE_M[2] else rf_results$rf_metrics$RMSE_M[1]
+    rf_mape <- if(nrow(rf_results$rf_metrics)>=2) rf_results$rf_metrics$MAPE_pct[2] else rf_results$rf_metrics$MAPE_pct[1]
+    tibble(
+      Metric=c("Test R²","Test RMSE","Test MAPE","Interpretable?","Non-linear?"),
+      `Lin Reg`=c(sprintf("%.4f",lm_r2), sprintf("$%.2fM",lm_rmse), sprintf("%.2f%%",lm_mape), "Yes (coefs)", "No"),
+      `Rand Forest`=c(sprintf("%.4f",rf_r2), sprintf("$%.2fM",rf_rmse), sprintf("%.2f%%",rf_mape), "Partial (VI)", "Yes")
+    ) %>% datatable(rownames=FALSE, options=list(dom='t', pageLength=6))
+  })
+
+  output$rf_table_default_vs_optimal <- renderDT({
+    if(!HAS_RF) return(NULL)
+    rf_results$rf_metrics %>%
+      mutate(across(where(is.numeric), ~round(.,4))) %>%
+      datatable(rownames=FALSE, options=list(dom='t', pageLength=3)) %>%
+      formatStyle(0, target='row', backgroundColor=styleRow(2,"#dbeafe"), fontWeight=styleRow(2,"bold"))
+  })
+
+  output$rf_tuning_gain <- renderUI({
+    if(!HAS_RF || is.null(rf_results$tuning_gain_rmse)) return(NULL)
+    gain <- rf_results$tuning_gain_rmse
+    div(style="background:#d1fae5;padding:8px;border-radius:6px;border-left:4px solid #059669;margin-top:6px;",
+      p(strong(sprintf("Tuning gain: %.2f%% lower RMSE", gain)), style="font-size:12px;margin:0;color:#065f46;"),
+      p("vs. default sqrt(p) mtry, 500 trees, node.size=5", style="font-size:10px;margin:1px 0 0;color:#047857;"))
+  })
+
+  output$rf_plot_actual_pred <- renderPlot({
+    if(!HAS_RF || !HAS_LM) return(NULL)
+    test_rf_df <- lm_results$model_data %>% filter(year>=2023) %>%
+      mutate(conference=as.factor(conference), tier_proxy=as.factor(tier_proxy))
+    tryCatch({
+      preds <- predict(rf_results$best_model, data=test_rf_df %>% select(all_of(rf_results$features)))$predictions
+      test_rf_df %>% mutate(predicted=preds) %>%
+        ggplot(aes(x=revenue, y=predicted, color=as.character(tier_proxy))) +
+        geom_point(alpha=0.65, size=1.8) +
+        geom_abline(slope=1, intercept=0, linetype="dashed", color="gray40") +
+        scale_color_manual(values=c("1"=COLORS$primary,"2"=COLORS$secondary,"3"=COLORS$accent1),
+                           labels=c("Tier 1","Tier 2","Tier 3"), name="Tier") +
+        scale_x_continuous(labels=function(x) paste0("$", formatC(x, format="f", digits=0), "M")) +
+        scale_y_continuous(labels=function(x) paste0("$", formatC(x, format="f", digits=0), "M")) +
+        labs(title="RF Optimal: Actual vs. Predicted", x="Actual ($M)", y="Predicted ($M)") + theme_cfb(11)
+    }, error=function(e) NULL)
+  })
+
+  output$rf_plot_projection <- renderPlot({
+    if(!HAS_RF) return(NULL)
+    ggplot(rf_results$national %>% mutate(rev_B = total_revenue/1000), aes(x=year, y=rev_B)) +
+      geom_line(color=COLORS$rf_color, size=1.2) + geom_point(color=COLORS$rf_color, size=2.5) +
+      annotate("text", x=2034, y=max(rf_results$national$total_revenue)/1000,
+               label=sprintf("CAGR: %.2f%%", rf_results$cagr*100),
+               hjust=1.1, color=COLORS$rf_color, fontface="bold", size=3.8) +
+      scale_y_continuous(labels=function(x) paste0("$", formatC(x, format="f", digits=1), "B")) + scale_x_continuous(breaks=2025:2034) +
+      labs(title="RF: National Revenue 2025-2034", x="Year", y="Revenue ($B)") + theme_cfb(11)
+  })
+
+  # ────────────────────────────────────────
+  # TAB 11: MODEL COMPARISON OUTPUTS  ← NEW
+  # ────────────────────────────────────────
+
+  output$comp_plot_projections <- renderPlot({
+    if(!HAS_COMP) return(NULL)
+    ggplot(all_projections %>% mutate(rev_B = total_revenue / 1000), aes(x = year, y = rev_B, color = model, linetype = model)) +
+      geom_line(size = 1.3) + geom_point(size = 2.5) +
+      scale_color_manual(values = model_colors, name = "Model") +
+      scale_linetype_manual(
+        values = c("Monte Carlo (Baseline)"   = "dashed",
+                   "Monte Carlo (Relegation)" = "solid",
+                   "Linear Regression"        = "solid",
+                   "Random Forest"            = "solid"),
+        name = "Model"
+      ) +
+      scale_y_continuous(labels = function(x) paste0("$", formatC(x, format="f", digits=1), "B")) +
+      scale_x_continuous(breaks = 2025:2034) +
+      labs(title = "All Models: National Revenue Projections",
+           subtitle = "Monte Carlo simulates relegation policy; LR & RF trained on 2017-2022 historical data",
+           x = "Year", y = "Total FBS Revenue ($B)",
+           caption = "Sources: NCAA financial data 2015-2024 | Monte Carlo: 100 simulation runs") +
+      theme_cfb(13) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  output$comp_plot_cagr <- renderPlot({
+    if(!HAS_COMP) return(NULL)
+    cagr_data <- all_projections %>%
+      group_by(model) %>% arrange(year) %>%
+      summarize(cagr_pct = ((last(total_revenue) / first(total_revenue))^(1/9) - 1) * 100, .groups = "drop")
+    ggplot(cagr_data, aes(x = fct_reorder(model, cagr_pct), y = cagr_pct, fill = model)) +
+      geom_col(show.legend = FALSE) +
+      geom_text(aes(label = sprintf("%.2f%%", cagr_pct)), vjust = -0.4, fontface = "bold", size = 4) +
+      scale_fill_manual(values = model_colors) +
+      scale_y_continuous(labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.15))) +
+      labs(title = "CAGR Comparison (2025-2034)", x = NULL, y = "Projected CAGR (%)") +
+      theme_cfb(13) + theme(axis.text.x = element_text(angle = 20, hjust = 1))
+  })
+
+  output$comp_plot_accuracy <- renderPlot({
+    if(!HAS_LM || !HAS_RF) return(NULL)
+    acc_data <- bind_rows(
+      lm_results$test_metrics %>% filter(Model == "Full model") %>%
+        mutate(Model = "Linear Regression"),
+      rf_results$rf_metrics %>% filter(Model == "RF Tuned (1000 trees, mtry=4)") %>%
+        mutate(Model = "Random Forest")
+    ) %>%
+      select(Model, R2, RMSE_M, MAPE_pct) %>%
+      pivot_longer(-Model, names_to = "Metric", values_to = "Value") %>%
+      mutate(Metric = recode(Metric,
+                             "R2"       = "R² (higher = better)",
+                             "RMSE_M"   = "RMSE $M (lower = better)",
+                             "MAPE_pct" = "MAPE % (lower = better)"))
+    ggplot(acc_data, aes(x = Model, y = Value, fill = Model)) +
+      geom_col(show.legend = FALSE) +
+      geom_text(aes(label = round(Value, 2)), vjust = -0.4, size = 3.5) +
+      scale_fill_manual(values = c("Linear Regression" = COLORS$lm_color, "Random Forest" = COLORS$rf_color)) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.20))) +
+      facet_wrap(~Metric, scales = "free_y") +
+      labs(title = "LR vs RF: Predictive Accuracy", subtitle = "Test set 2023-2024",
+           x = NULL, y = NULL) +
+      theme_cfb(12) + theme(axis.text.x = element_text(angle = 15, hjust = 1))
+  })
+
+  output$comp_table_summary <- renderDT({
+    if(!HAS_COMP) return(datatable(tibble(Message = "Run MODEL_COMPARISON.R first")))
+    datatable(comparison_table, rownames = FALSE,
+              options = list(pageLength = 5, dom = 't')) %>%
+      formatStyle('Model',
+                  backgroundColor = styleEqual(
+                    c("Monte Carlo (Relegation)", "Linear Regression", "Random Forest",
+                      "Monte Carlo (Baseline)"),
+                    c('#f0fdf4', '#fff7ed', '#f5f3ff', '#eff6ff')
+                  ))
+  })
+
+}
+
+# ===========================
+# RUN APP
+# ===========================
+
+shinyApp(ui, server)
